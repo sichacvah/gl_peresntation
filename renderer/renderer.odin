@@ -208,7 +208,8 @@ load_image_to_texture :: proc(
   height: int,
   buf: rawptr,
   chans: int,
-) -> (id: u32, ok: bool) {
+) -> (u32, bool) {
+  id : u32
   w := i32(width)
   h := i32(height)
   if buf == nil {

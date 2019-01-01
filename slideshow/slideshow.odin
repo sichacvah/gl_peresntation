@@ -23,12 +23,18 @@ SlideShow :: struct {
   mouse_state:   MouseState,
   r:             ^r.Renderer,
   key:           wnd.Key,
+  pass_id:       int,
+}
+
+init_slide_show :: proc(s: ^SlideShow) {
+  s.pass_id = -1 
 }
 
 ColorBackground :: distinct r.Color
 ImgBackground :: struct {
-	tex_id: r.Texture,
 	img_id: int,
+  tex_id: u32,
+  is_tex: bool,
 }
 
 None :: struct {}
@@ -57,11 +63,15 @@ SlidePanel :: struct {
 	bg:      Background,
 	pos:     Position,
 	size:    Size,
+  parent:  int,
+  pass_id: int,
 }
 
+PANELS_SIZE :: 64
+
 Slide :: struct {
-	panels: k.ItemsStack(SlidePanel, 64),
-	texts:  k.ItemsStack(SlideText, 128),
+	panels: k.ItemsStack(SlidePanel, PANELS_SIZE),
+	texts:  k.ItemsStack(SlideText, PANELS_SIZE * 2),
   _current_panel: int,
 }
 
@@ -117,7 +127,7 @@ COLOR_FOAM :: r.Color{0x9c, 0xcf, 0xd8, 0xff}
 // #f6c177
 COLOR_GOLD :: r.Color{0xf6, 0xc1, 0x77, 0xff}
 //#eb6f92
-COLOR_LOVE :: r.Color{0xeb, 0xbf, 0x92, 0xff}
+COLOR_LOVE :: r.Color{0xeb, 0x6f, 0x92, 0xff}
 // #ebbcba
 COLOR_ROSE :: r.Color{0xeb, 0xbc, 0xba, 0xff}
 // #191724
@@ -168,7 +178,19 @@ get_absolute_position :: #force_inline proc(w: i32, h: i32, pos: Position) -> Ab
 	case AbsolutePosition:
 		apos = p
 	case RelativePosition:
-		apos = AbsolutePosition{p.x * f32(w), p.y * f32(h)}
+    x := f32(w) * p.x
+    y := f32(h) * p.y
+    if p.x == -1.0 {
+      x = y
+    }
+    if p.y == -1.0 {
+      y = x
+    }
+    if p.x == -1.0 && p.y == -1.0 {
+      x = 0
+      y = 0
+    }
+		apos = AbsolutePosition{x, y}
 	}
 	return apos
 }
@@ -179,7 +201,19 @@ get_absolute_size :: #force_inline proc(w: i32, h: i32, size: Size) -> AbsoluteS
 	case AbsoluteSize:
 		asize = s
 	case RelativeSize:
-		asize = AbsoluteSize{s.x * f32(w), s.y * f32(h)}
+    x := f32(w) * s.x
+    y := f32(h) * s.y
+    if s.x == -1.0 {
+      x = y
+    }
+    if s.y == -1.0 {
+      y = x
+    }
+    if s.x == -1.0 && s.y == -1.0 {
+      x = 0
+      y = 0
+    }
+		asize = AbsoluteSize{x, y}
 	}
 	return asize
 }
@@ -187,6 +221,7 @@ get_absolute_size :: #force_inline proc(w: i32, h: i32, size: Size) -> AbsoluteS
 draw_bg :: #force_inline proc(slides: ^SlideShow, panel_id: int) {
   slide := get_current_slide(slides)
   panel : ^SlidePanel = &slide.panels.items[panel_id]
+  panel.pass_id = slides.pass_id
 	width, height := wnd.get_size(slides.r.window_handle)
 	abs_pos := get_absolute_position(width, height, panel.pos)
 	abs_size := get_absolute_size(width, height, panel.size)
@@ -205,10 +240,19 @@ draw_bg :: #force_inline proc(slides: ^SlideShow, panel_id: int) {
 		}
 	}
 
-	switch bg in panel.bg {
+	switch &bg in panel.bg {
 	case None:
 		return
 	case ImgBackground:
+    if !bg.is_tex {
+	    tex_id, ok := load_image_to_texture(slides, bg.img_id)
+      if !ok {
+        fmt.eprintln("Can't load image to gpu", bg.img_id)
+        return
+      }
+      bg.tex_id = tex_id
+      bg.is_tex = true
+    }
 		r.render_quad(
 			slides.r,
 			abs_pos.x,
@@ -216,7 +260,7 @@ draw_bg :: #force_inline proc(slides: ^SlideShow, panel_id: int) {
 			abs_size.x,
 			abs_size.y,
 			{0xff, 0xff, 0xff, 0xff},
-			bg.tex_id,
+			r.Texture(bg.tex_id),
 		)
 	case ColorBackground:
 		r.render_quad(
@@ -269,18 +313,59 @@ draw_panel_text :: #force_inline proc(slides: ^SlideShow, slide: ^Slide, panel_i
 	r.render_text(slides.r, text.text, {x, y}, text.color, text.fv)
 }
 
+IdsStack :: k.ItemsStack(int, PANELS_SIZE)
+
+ids_push :: proc(stack: ^IdsStack, id: int) {
+  assert(stack.id < len(stack.items))
+  stack.items[stack.id] = id
+  stack.id += 1
+}
+
+ids_pop :: proc(stack: ^IdsStack) -> int {
+  assert(stack.id > 0)
+  id := stack.items[stack.id - 1]
+  stack.id -= 1
+  return id
+}
+
+ids_size :: #force_inline proc(stack: ^IdsStack) -> int {
+  return stack.id
+}
+
 render_slides :: proc(slides: ^SlideShow) {
-	if slides.slides_count > 0 {
+  ids : IdsStack
+  slides.pass_id += 1
+
+	if slides.slides_count > 0 {    
 		slide := &slides.items[slides.current_slide]
-		for i := 0; i < slide.panels.id; i += 1 {
-			draw_bg(slides, i)
-      for tid := 0; tid < slide.texts.id; tid += 1 {
-        panel_id := slide.texts.items[tid].panel_id
-        if panel_id == i {
-          draw_panel_text(slides, slide, i, tid)
-        }
+    if slide.panels.id == 0 {
+      return
+    }
+    panel_id := 0
+    ids_push(&ids, panel_id)
+    for ids_size(&ids) > 0 {
+      id := ids_pop(&ids)
+      panel : ^SlidePanel = &slide.panels.items[id]
+      if panel_id < slide.panels.id {
+        panel_id += 1
+        ids_push(&ids, panel_id)
       }
-		}
+      if panel.pass_id != slides.pass_id {
+        panel.pass_id = slides.pass_id
+        for i := 0; i < slide.panels.id; i += 1 {
+          if slide.panels.items[i].parent == id {
+            ids_push(&ids, i)
+          }
+        }
+			  draw_bg(slides, id)
+        for tid := 0; tid < slide.texts.id; tid += 1 {
+          i := slide.texts.items[tid].panel_id
+          if panel_id == i {
+            draw_panel_text(slides, slide, i, tid)
+          }
+        }
+      } 
+    }
 	}
 }
 
@@ -350,11 +435,13 @@ end_slide :: proc(slides: ^SlideShow) {
 begin_panel :: proc(s: ^SlideShow, pos: Position, size: Size) {
   slide := get_current_slide(s)
   assert(slide.panels.id < len(slide.panels.items)) 
+  parent := slide._current_panel
   slide.panels.id += 1
   slide._current_panel = slide.panels.id - 1
   panel := get_current_panel(get_current_slide(s))
   panel.pos = pos
   panel.size = size
+  panel.parent = parent
 }
 
 end_panel :: proc(s: ^SlideShow) {
@@ -382,6 +469,7 @@ load_image :: proc(slides: ^SlideShow, path: string) -> int {
 	img := Image{}
 	img.buf = stbi.load(strings.clone_to_cstring(path), &img.w, &img.h, &img.channes, 0)
 	if img.buf == nil {
+    fmt.println("BUF IS NULL", path, strings.clone_to_cstring(path))
 		return -1
 	}
 	append(&slides.images, img)
@@ -391,15 +479,12 @@ load_image :: proc(slides: ^SlideShow, path: string) -> int {
 set_panel_image :: proc(s: ^SlideShow, path: string) {
   img_id := load_image(s, path)
 	assert(img_id >= 0, "fail to load img")
-	tex_id, ok := load_image_to_texture(s, img_id)
-	assert(ok, "fail to load texture to gpu")
-
   slide := get_current_slide(s)
 
 	id := slide.panels.id
 	assert(id <= len(slide.panels.items))
   panel := get_current_panel(slide)
-  panel.bg = ImgBackground{tex_id = r.Texture(tex_id), img_id = img_id}
+  panel.bg = ImgBackground{img_id = img_id}
 }
 
 
