@@ -10,6 +10,8 @@ import "core:strings"
 import gl "vendor:OpenGL"
 import "core:os"
 import "core:unicode/utf8"
+import "../window"
+import k "../kernel"
 
 /*
 
@@ -40,7 +42,7 @@ Public API:
  ██████  ██████  ██   ████ ███████    ██    ██   ██ ██   ████    ██    ███████ 
 -> Constants                                                                                                                                                   
 */
-
+MAX_TEXTURES :: 8
 /*
   LOCATIONS in ui_vert.glsl
   defined with layout(location = *SOMECONST*)
@@ -48,9 +50,10 @@ Public API:
 POS_LOCATION :: 0
 TEX_COORD_LOCATION :: 1
 COLOR_LOCATION :: 2
+TEX_INDEX_LOCATION :: 3
 
 // Buffer size for verticies
-BUFFER_SIZE :: 16384
+BUFFER_SIZE :: 1024
 // Empty white texture size 
 EMPTY_TEXTURE_SIZE :: 3
 
@@ -77,7 +80,7 @@ MAX_FONTVARIANTS :: MAX_FONTS_COUNT * MAX_FV_PER_FONT
 Using same shader for both ui and image render
 */
 EmptyTexture :: struct {
-	id:     u32,
+	id:     Texture,
 	buf:    [EMPTY_TEXTURE_SIZE * EMPTY_TEXTURE_SIZE * 4]u8,
 	width:  i32,
 	height: i32,
@@ -143,10 +146,7 @@ VertexArray :: struct($T: typeid, $N: int) {
   attrib: i32,
 }
 
-ItemsStack :: struct($T: typeid, $N: int) {
-  id: int,
-  items: [N]T,
-}
+
 
 Color :: struct {
 	r, g, b, a: u8,
@@ -161,19 +161,84 @@ Renderer :: struct {
   shaders: [Shader.max]u32,
   current_shader: Shader,
   white_tex: EmptyTexture,
-  window_handle: glfw.WindowHandle,
+  window_handle: rawptr,
+  tex_uniform: i32,
   uniform_projection: i32,
   vao: u32,
   verticies: VertexArray(glm.vec2, BUFFER_SIZE * 4),
   colors:    VertexArray(Color, BUFFER_SIZE * 4),
   tex_coords: VertexArray(glm.vec2, BUFFER_SIZE * 4),
+  tex_ids:    VertexArray(f32, BUFFER_SIZE * 4),
   indicies:  VertexArray(u16, BUFFER_SIZE * 6),
   buffer_indx: int,
   // Add one for invalid font/fontvariant
-  fonts: ItemsStack(Font, MAX_FONTS_COUNT + 1),
-  fontvariants: ItemsStack(FontVariant, MAX_FONTS_COUNT * MAX_FV_PER_FONT + 1),
+  fonts: k.ItemsStack(Font, MAX_FONTS_COUNT + 1),
+  fontvariants: k.ItemsStack(FontVariant, MAX_FONTS_COUNT * MAX_FV_PER_FONT + 1),
+  textures: k.ItemsStack(Texture, MAX_TEXTURES),
+  current_fv: int,
 }
 
+Texture :: distinct u32
+
+load_texture :: proc(data: []byte, width: i32, height: i32) -> Texture {
+
+  tex : u32
+  gl.GenTextures(1, &tex)
+  gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S,     gl.REPEAT)
+  gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T,     gl.REPEAT)
+  gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR)
+  gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+  gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, raw_data(data));
+
+  return Texture(tex)
+}
+
+/*
+
+██ ███    ███  █████   ██████  ███████ ███████ 
+██ ████  ████ ██   ██ ██       ██      ██      
+██ ██ ████ ██ ███████ ██   ███ █████   ███████ 
+██ ██  ██  ██ ██   ██ ██    ██ ██           ██ 
+██ ██      ██ ██   ██  ██████  ███████ ███████ 
+-> Images                                               
+                                               
+*/
+load_image_to_texture :: proc(
+  width: int, 
+  height: int,
+  buf: rawptr,
+  chans: int,
+) -> (id: u32, ok: bool) {
+  w := i32(width)
+  h := i32(height)
+  if buf == nil {
+    return 0, false
+  }
+
+  gl.GenTextures(1, &id)
+  gl.BindTexture(gl.TEXTURE_2D, id)
+  if chans == 3 {
+		gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGB8, w, h, 0, gl.RGB, gl.UNSIGNED_BYTE, nil)
+	} else if chans == 4 {
+		gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, nil)
+	} else {
+    unreachable()
+  }
+  gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+
+  if chans == 3 {
+		gl.TexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGB, gl.UNSIGNED_BYTE, buf)
+  } else if chans == 4 {
+		gl.TexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf)
+  } else {
+    unreachable()
+  }
+ 
+  return id, true
+}
 
 /*
 
@@ -184,6 +249,18 @@ Renderer :: struct {
 ██   ██ ███████ ██   ████ ██████  ███████ ██   ██ ███████ ██   ██ 
 -> Renderer                                                                                                                                    
 */
+
+init_gl :: #force_inline proc() {
+  gl.Enable(gl.BLEND)
+  gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+  gl.BlendEquation(gl.FUNC_ADD)
+
+  gl.Disable(gl.CULL_FACE)
+  gl.Disable(gl.DEPTH_TEST)
+
+  gl.Enable(gl.SCISSOR_TEST)
+  gl.Enable(gl.MULTISAMPLE)
+}
 
 renderer_init :: proc(allocator: mem.Allocator) -> ^Renderer {
   r := new(Renderer, allocator)
@@ -197,6 +274,7 @@ renderer_init :: proc(allocator: mem.Allocator) -> ^Renderer {
   for _, i in r.white_tex.buf {
     r.white_tex.buf[i] = 255
   }
+
   return r
 }
 
@@ -283,7 +361,7 @@ load_symbols :: #force_inline proc(fontinfo: ^stbtt.fontinfo, fontvariant: ^Font
 ASCI_SIZE :: 96
 ASCI_START :: 32
 asci_symbols := [ASCI_SIZE]rune{}
-CYRILLYC_SIZE :: 63
+CYRILLYC_SIZE :: 64
 CYRILLYC_START :: 1040
 cyrillyc_symbols := [CYRILLYC_SIZE]rune{}
 
@@ -328,7 +406,7 @@ init_font_variant :: proc(r: ^Renderer, allocator: mem.Allocator, fontname: stri
   load_symbols(fontinfo, fontvariant, cyrillyc_symbols[:])
   load_symbols(fontinfo, fontvariant, {'▶', '▼'})
    
-  //gl.ActiveTexture(gl.TEXTURE1)
+  gl.ActiveTexture(gl.TEXTURE0)
   gl.GenTextures(1, &fontvariant.atlas.tex_id) 
   gl.BindTexture(gl.TEXTURE_2D, fontvariant.atlas.tex_id)
   gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
@@ -445,21 +523,45 @@ init_all_programms :: proc(r: ^Renderer) {
 	}
 }
 
-render_quad :: #force_inline proc(r: ^Renderer, x: f32, y: f32, width: f32, height: f32, color: Color) {
+INVALID_TEX :: MAX_TEXTURES + 1
+textures :[MAX_TEXTURES]i32 = {0, 1, 2, 3, 4, 5, 6, 7}
+
+render_quad :: #force_inline proc(r: ^Renderer, x: f32, y: f32, width: f32, height: f32, color: Color, tex: Texture) {
   if r.current_shader != Shader.ui {
     change_shader(r, Shader.ui)
-    gl.BindTexture(gl.TEXTURE_2D, r.white_tex.id)
   }
+
+  tex_indx : u32 = INVALID_TEX
+  for i := 0; i < r.textures.id; i += 1 {
+    if r.textures.items[i] == tex {
+      tex_indx = u32(i);
+      break;
+    }
+  }
+
+  if tex_indx == INVALID_TEX && r.textures.id >= MAX_TEXTURES {
+    flush(r)
+  }
+
+  if tex_indx == INVALID_TEX {
+    r.textures.items[r.textures.id] = tex
+    tex_indx = u32(r.textures.id)
+    r.textures.id += 1
+  }
+
   push_quad(
     r,
 		Quad{tl = {x, y}, br = {x + width, y + height}},
     color,
-		Quad{tl = {0.0, 0.0}, br = {1.0, 1.0}}
+		Quad{tl = {0.0, 0.0}, br = {1.0, 1.0}},
+    f32(tex_indx),
   )
 }
 
 get_font :: proc(r: ^Renderer, id: int) -> ^Font {
-	assert(id < MAX_FONTS_COUNT && id != INVALID_FONT_ID && id < r.fonts.id)
+  assert(id < MAX_FONTS_COUNT)
+  assert(id != INVALID_FONT_ID)
+  assert(r.fonts.id > id)
 	return &r.fonts.items[id]
 }
 
@@ -467,7 +569,8 @@ flush :: proc(r: ^Renderer) {
   if r.buffer_indx == 0 {
     return
   }
-	w, h := glfw.GetWindowSize(r.window_handle)
+ 
+	w, h := window.get_size(r.window_handle)
 	gl.Viewport(0, 0, w, h)
 	projection := glm.mat4Ortho3d(0.0, f32(w), f32(h), 0.0, -1.0, 1.0)
 
@@ -496,19 +599,36 @@ flush :: proc(r: ^Renderer) {
 		raw_data(r.tex_coords.items[0:r.buffer_indx * 4]),
 	)
 
+  if r.current_shader == Shader.ui  { 
+    gl.BindBuffer(gl.ARRAY_BUFFER, r.tex_ids.id)
+    gl.BufferSubData(
+      gl.ARRAY_BUFFER,
+      0,
+      r.buffer_indx * 4 * size_of(f32),
+      raw_data(r.tex_ids.items[0:r.buffer_indx * 4])
+    )
+    r.tex_uniform = gl.GetUniformLocation(r.shaders[r.current_shader], "u_tex")
+    gl.Uniform1iv(r.tex_uniform, MAX_TEXTURES, raw_data(textures[:]))
+    for i := 0; i < r.textures.id; i += 1 {
+      gl.ActiveTexture(gl.TEXTURE0 + u32(i))
+      gl.BindTexture(gl.TEXTURE_2D, u32(r.textures.items[i]))
+    } 
+  }
+
 	gl.BindBuffer(gl.ELEMENT_ARRAY_BUFFER, r.indicies.id)
 	gl.BufferSubData(
 		gl.ELEMENT_ARRAY_BUFFER,
 		0,
 		r.buffer_indx * 6 * size_of(r.indicies.items[0]),
 		raw_data(r.indicies.items[0:r.buffer_indx * 6]),
-	)
+	) 
 
 	gl.DrawElements(gl.TRIANGLES, i32(r.buffer_indx * 6), gl.UNSIGNED_SHORT, nil)
 	r.buffer_indx = 0
+  r.textures.id = 1
 }
 
-push_quad :: proc(r: ^Renderer, quad: Quad, color: Color, tex: Quad) {
+push_quad :: proc(r: ^Renderer, quad: Quad, color: Color, tex: Quad, tex_indx: f32) {
 	if r.buffer_indx == BUFFER_SIZE {
 		flush(r)
 	}
@@ -535,6 +655,15 @@ push_quad :: proc(r: ^Renderer, quad: Quad, color: Color, tex: Quad) {
 	r.indicies.items[r.buffer_indx * 6 + 3] = u16(r.buffer_indx * 4 + 0)
 	r.indicies.items[r.buffer_indx * 6 + 4] = u16(r.buffer_indx * 4 + 3)
 	r.indicies.items[r.buffer_indx * 6 + 5] = u16(r.buffer_indx * 4 + 1)
+  r.tex_ids.items[r.buffer_indx * 4 + 0] = tex_indx
+  r.tex_ids.items[r.buffer_indx * 4 + 1] = tex_indx
+  r.tex_ids.items[r.buffer_indx * 4 + 2] = tex_indx
+  r.tex_ids.items[r.buffer_indx * 4 + 3] = tex_indx
+
+  /*
+  r.tex_ids.items[r.buffer_indx * 6 + 4] = tex_indx
+  r.tex_ids.items[r.buffer_indx * 6 + 5] = tex_indx
+  */
 
 	r.buffer_indx += 1
 }
@@ -564,7 +693,8 @@ render_rune :: proc(rendr: ^Renderer, r: rune, x: f32, y: f32, color: Color, fv:
         ch.tex_x + (f32(ch.bwidth) / f32(fv.atlas.width)),
         f32(ch.bheight) / f32(fv.atlas.height),
       }
-    }
+    },
+    0,
   )
 
   x0 += i32(ch.advance_x)
@@ -602,11 +732,18 @@ measure_text :: proc(rendr: ^Renderer, text: string, fv: int) -> i32 {
   return render_text(rendr, text, {0, 0}, {0,0,0,0}, fv, false)
 }
 
-render_text :: proc(rendr: ^Renderer, text: string, start: [2]i32, color: Color, fv: int, should_render: bool = true) -> i32 {
-  fv := rendr.fontvariants.items[fv]
+render_text :: proc(rendr: ^Renderer, text: string, start: [2]i32, color: Color, fvid: int, should_render: bool = true) -> i32 {
+  assert(fvid != INVALID_FV_ID)
+  fv := rendr.fontvariants.items[fvid]
   if should_render && rendr.current_shader != Shader.text {
-    change_shader(rendr, .text)
-    //gl.ActiveTexture(gl.TEXTURE1)
+    change_shader(rendr, .text) 
+    gl.ActiveTexture(gl.TEXTURE0)
+    gl.BindTexture(gl.TEXTURE_2D, fv.atlas.tex_id)
+  }
+  if should_render && fvid != rendr.current_fv {
+    flush(rendr)
+    rendr.current_fv = fvid
+    gl.ActiveTexture(gl.TEXTURE0)
     gl.BindTexture(gl.TEXTURE_2D, fv.atlas.tex_id)
   }
  
@@ -615,8 +752,7 @@ render_text :: proc(rendr: ^Renderer, text: string, start: [2]i32, color: Color,
   y := start[1]
   ascent := f32(fv.ascent) * fv.scale
   i := 0;
-  for i < len(text) {
-    
+  for i < len(text) { 
     r, size := utf8.decode_rune_in_string(text[i:])
     ch := fv.chars[r]
     x1 := f32(x0 + ch.xoff)
@@ -637,7 +773,8 @@ render_text :: proc(rendr: ^Renderer, text: string, start: [2]i32, color: Color,
             ch.tex_x + (f32(ch.bwidth) / f32(fv.atlas.width)),
             f32(ch.bheight) / f32(fv.atlas.height),
           }
-        }
+        },
+        0,
       )
     }
     i += size
@@ -647,8 +784,8 @@ render_text :: proc(rendr: ^Renderer, text: string, start: [2]i32, color: Color,
   return i32(x0) - start.x
 }
 
-clean :: proc(r: ^Renderer) {
-  w, h := glfw.GetWindowSize(r.window_handle)
+clean :: #force_inline proc(r: ^Renderer) {
+  w, h := window.get_size(r.window_handle)
   gl.Scissor(0, 0, w, h)
   gl.ClearColor(0x19 / 255.0, 0x17 / 255.0, 0x24 / 255.0, 1.0)
   gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
@@ -694,6 +831,7 @@ init_resources :: proc(r: ^Renderer) -> bool {
   r.verticies.attrib = POS_LOCATION
   r.tex_coords.attrib = TEX_COORD_LOCATION
   r.colors.attrib = COLOR_LOCATION
+  r.tex_ids.attrib = TEX_INDEX_LOCATION
 
   gl.GenVertexArrays(1, &r.vao)
   gl.BindVertexArray(r.vao)
@@ -702,6 +840,7 @@ init_resources :: proc(r: ^Renderer) -> bool {
 	gl.GenBuffers(1, &r.indicies.id)
 	gl.GenBuffers(1, &r.colors.id)
 	gl.GenBuffers(1, &r.tex_coords.id)
+  gl.GenBuffers(1, &r.tex_ids.id)
 
 	gl.BindBuffer(gl.ARRAY_BUFFER, r.tex_coords.id)
 	gl.BufferData(
@@ -754,6 +893,23 @@ init_resources :: proc(r: ^Renderer) -> bool {
 		0,
 	)
 
+  gl.BindBuffer(gl.ARRAY_BUFFER, r.tex_ids.id)
+  gl.BufferData(
+    gl.ARRAY_BUFFER,
+		len(r.tex_ids.items) * size_of(r.tex_ids.items[0]),
+    nil,
+    gl.DYNAMIC_DRAW,
+  )
+  gl.EnableVertexAttribArray(u32(r.tex_ids.attrib))
+  gl.VertexAttribPointer(
+		u32(r.tex_ids.attrib),
+		1,
+		gl.FLOAT,
+		false,
+		size_of(r.tex_ids.items[0]),
+		0,
+	)
+
 	gl.BindBuffer(gl.ELEMENT_ARRAY_BUFFER, r.indicies.id)
 	gl.BufferData(
 		gl.ELEMENT_ARRAY_BUFFER,
@@ -762,10 +918,11 @@ init_resources :: proc(r: ^Renderer) -> bool {
 		gl.DYNAMIC_DRAW,
 	)
 
-	// White texture
-	//gl.ActiveTexture(gl.TEXTURE0)
-	gl.GenTextures(1, &r.white_tex.id)
-	gl.BindTexture(gl.TEXTURE_2D, r.white_tex.id)
+  gl.ActiveTexture(gl.TEXTURE0)
+  r.white_tex.id = r.textures.items[0]
+  r.textures.id = 1
+
+  gl.BindTexture(gl.TEXTURE_2D, u32(r.white_tex.id))
 
   gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.MIRRORED_REPEAT);
   gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.MIRRORED_REPEAT);
